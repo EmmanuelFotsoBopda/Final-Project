@@ -1,0 +1,154 @@
+from fastapi import FastAPI, HTTPException, Query, status
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+from pathlib import Path
+import json
+import threading
+from controller_functions import load_tasks, save_tasks, _find_task_index
+
+# File to store tasks (JSON Lines format)
+DATA_FILE = Path("tasks.txt")
+
+app = FastAPI()
+
+
+# Pydantic models
+class TaskCreate(BaseModel):
+    title: str
+    description: str | None = None
+    
+class TaskUpdate(BaseModel):
+    title: str
+    description: str
+    completed: bool | None = None
+
+class Task(BaseModel):
+    id: int
+    title: str
+    description: str | None = None
+    completed: bool = False
+
+# In-memory list of tasks (each task stored as a plain dict)
+_tasks: list[dict] = []
+
+# Next id counter (int)
+_next_id: int = 1
+
+# Lock to protect operations that read/modify _tasks and _next_id and write file
+_storage_lock = threading.Lock()
+
+# Initialize in-memory state from file at startup
+with _storage_lock:
+    _tasks = load_tasks(DATA_FILE)
+    if _tasks:
+        try:
+            max_id = max(int(t["id"]) for t in _tasks if "id" in t)
+            _next_id = max_id + 1
+        except Exception:
+            _next_id = 1
+    else:
+        _next_id = 1
+
+
+# Endpoints
+@app.get("/", summary="Root check")
+def root_check():
+    return {"status": "ok", "tasks_file": str(DATA_FILE)}
+
+
+@app.post("/tasks", response_model=Task, status_code=status.HTTP_201_CREATED)
+def create_task(payload: TaskCreate):
+    """
+    Create a new task. This:
+    - assigns the next auto-increment id,
+    - validates using the Task Pydantic model,
+    - appends to in-memory list,
+    - saves the whole list to the data file (overwriting),
+    - increments the next id.
+    All of the above is done while holding the storage lock to avoid races in a single-process server.
+    """
+    global _next_id, _tasks
+    with _storage_lock:
+        task_dict = {"id": _next_id, "title": payload.title, "description" : payload.description, "completed": False}
+        # Validate using Pydantic
+        task_obj = Task(**task_dict)
+        # append the plain dict (not the Pydantic model) for simpler JSON saving
+        _tasks.append(task_obj.dict())
+        # persist to disk
+        save_tasks(DATA_FILE, _tasks)
+        _next_id += 1
+        return task_obj
+        
+@app.get("/tasks", response_model=List[Task])
+def get_all_tasks(completed: Optional[bool] = Query(None, description="Filter by completion status")):
+    """
+    Get all tasks. Optionally filter by ?completed=true or ?completed=false.
+    """
+    with _storage_lock:
+        if completed is None:
+            return [Task(**t) for t in _tasks]
+        filtered = [Task(**t) for t in _tasks if bool(t.get("completed")) == completed]
+        return filtered
+        
+        
+@app.get("/tasks/{task_id}", response_model=Task)
+def get_single_task(task_id: int):
+    with _storage_lock:
+        idx = _find_task_index(_tasks, task_id)
+        if idx is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return Task(**_tasks[idx])
+        
+        
+@app.put("/tasks/{task_id}", response_model=Task)
+def update_task(task_id: int, payload: TaskUpdate):
+    """
+    Completely replace (update) the task with the provided title, description and completed fields.
+    """
+    global _tasks
+    with _storage_lock:
+        idx = _find_task_index(_tasks, task_id)
+        if idx is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        new_task = {"id": task_id, "title": payload.title, "description" : payload.description, "completed": payload.completed}
+        # Validate
+        task_obj = Task(**new_task)
+        _tasks[idx] = task_obj.dict()
+        save_tasks(DATA_FILE,_tasks)
+        return task_obj
+
+
+@app.get("/tasks", response_model=list[Task])
+def list_tasks():
+    # No lock required for read-only access, but if you prefer strict consistency you can lock
+    with _storage_lock:
+        # Return Pydantic-validated list
+        return [Task(**t) for t in _tasks]
+
+@app.delete("/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_task(task_id: int):
+    """
+    Delete a single task. Returns 204 on success.
+    """
+    global _tasks
+    with _storage_lock:
+        idx = _find_task_index(_tasks, task_id)
+        if idx is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        _tasks.pop(idx)
+        save_tasks(DATA_FILE,_tasks)
+    return None
+
+
+@app.delete("/tasks", status_code=status.HTTP_204_NO_CONTENT)
+def delete_all_tasks():
+    """
+    Delete all tasks (clear in-memory and truncate the JSON file).
+    """
+    global _tasks, _next_id
+    with _storage_lock:
+        _tasks = []
+        _next_id = 1
+        # Truncate file by saving empty list
+        save_tasks(DATA_FILE,_tasks)
+    return None
